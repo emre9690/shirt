@@ -90,7 +90,11 @@ function bodyPanel(id: string, p: TShirtParams, neckDepth: number): Panel {
       { id: 'side_r', points: [hemR, armR] },
       { id: 'arm_r', points: curve(armR, [sh, armY + p.armholeDepth * 0.3], shR) },
       { id: 'shoulder_r', points: [shR, neckR] },
-      { id: 'neck', points: curve(neckR, [0, L - neckDepth * 2], neckL) },
+      // A half ellipse gives a round crew neck. A single quadratic reads as a V.
+      { id: 'neck', points: Array.from({ length: 25 }, (_, k): Vec2 => {
+        const angle = (k / 24) * Math.PI;
+        return k === 0 ? neckR : k === 24 ? neckL : [nw * Math.cos(angle), L - neckDepth * Math.sin(angle)];
+      }) },
       { id: 'shoulder_l', points: [neckL, shL] },
       { id: 'arm_l', points: curve(shL, [-sh, armY + p.armholeDepth * 0.3], armL) },
       { id: 'side_l', points: [armL, hemL] },

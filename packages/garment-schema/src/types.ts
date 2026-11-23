@@ -32,7 +32,11 @@ export interface Opening {
   edges: EdgeRef[];
 }
 
-export type ReconstructionMethod = 'procedural-template' | 'sewformer';
+/**
+ * 'sewformer-guided-template': the template's panels, with proportions measured from an
+ * executed SewFormer prediction. It is not a direct mesh of the predicted panels.
+ */
+export type ReconstructionMethod = 'procedural-template' | 'sewformer-guided-template';
 
 export interface GarmentPattern {
   schemaVersion: number;

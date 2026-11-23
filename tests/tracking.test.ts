@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { ClothSolver } from '../apps/web/src/physics/xpbd';
 import { prepareTemplateGarment, TryOnSession } from '../apps/web/src/runtime';
 import {
-  DEFAULT_PROFILE, LM, bodyCapsules, bodyFrame, fitGarment, fitImage, poseFromWorld, syntheticPose, type Landmark,
+  DEFAULT_PROFILE, LM, bodyCapsules, bodyFrame, fitGarment, fitImage, poseFromWorld, syntheticPose, type BodyPose, type Landmark,
 } from '../apps/web/src/tracking/body';
+import frontPose from './fixtures/front-pose.json';
 import { OneEuroVector } from '../apps/web/src/tracking/oneEuro';
 
 function worldLandmarks(): Landmark[] {
@@ -79,7 +80,7 @@ describe('garment on a moving body', () => {
   });
 
   it('stays finite, bounded and unstretched through synthetic motion', () => {
-    const session = new TryOnSession(prepareTemplateGarment('M', 0.04), DEFAULT_PROFILE);
+    const session = new TryOnSession(prepareTemplateGarment('M'), DEFAULT_PROFILE);
     let worst = 0;
     for (let f = 0; f < 60 * 12; f++) {
       session.updatePose(syntheticPose(f / 60));
@@ -89,32 +90,32 @@ describe('garment on a moving body', () => {
     }
     expect(session.solver.resets).toBe(0);
     expect(session.refits).toBe(1);
-    expect(worst).toBeLessThan(0.6);
+    expect(worst).toBeLessThan(0.35);
   });
 
   it('keeps moving after the pose stops, then settles', () => {
-    const session = new TryOnSession(prepareTemplateGarment('M', 0.04), DEFAULT_PROFILE);
+    const session = new TryOnSession(prepareTemplateGarment('M'), DEFAULT_PROFILE);
     for (let f = 0; f < 240; f++) {
       session.updatePose(syntheticPose(f / 60));
       session.step(1 / 60);
     }
-    const speed = (s: ClothSolver) => {
-      let max = 0;
-      for (let k = 0; k < s.n; k++) max = Math.max(max, Math.hypot(s.v[k * 3], s.v[k * 3 + 1], s.v[k * 3 + 2]));
-      return max;
+    // Median vertex movement across one displayed frame, in millimetres.
+    const frameMovement = (s: ClothSolver) => {
+      const before = s.x.slice();
+      session.step(1 / 60);
+      const moves = Array.from({ length: s.n }, (_, v) => Math.hypot(s.x[v * 3] - before[v * 3], s.x[v * 3 + 1] - before[v * 3 + 1], s.x[v * 3 + 2] - before[v * 3 + 2]) * 1000).sort((a, b) => a - b);
+      return moves[moves.length >> 1];
     };
-    const held = syntheticPose(240 / 60);
-    session.updatePose(held);
-    session.step(1 / 60);
-    const early = speed(session.solver);
-    for (let f = 0; f < 60 * 6; f++) session.step(1 / 60);
-    const late = speed(session.solver);
-    expect(early).toBeGreaterThan(0.005);
-    expect(late).toBeLessThan(early);
+    session.updatePose(syntheticPose(240 / 60));
+    const early = frameMovement(session.solver);
+    for (let f = 0; f < 60 * 8; f++) session.step(1 / 60);
+    const late = frameMovement(session.solver);
+    expect(early).toBeGreaterThan(0.2);
+    expect(late).toBeLessThan(0.02);
   });
 
   it('refits after a tracking teleport without stretching', () => {
-    const session = new TryOnSession(prepareTemplateGarment('M', 0.04), DEFAULT_PROFILE);
+    const session = new TryOnSession(prepareTemplateGarment('M'), DEFAULT_PROFILE);
     session.updatePose(syntheticPose(0));
     for (let f = 0; f < 30; f++) session.step(1 / 60);
     const moved = syntheticPose(0);
@@ -122,7 +123,57 @@ describe('garment on a moving body', () => {
     session.updatePose(moved);
     session.step(1 / 60);
     expect(session.refits).toBe(2);
-    expect(session.solver.maxStrain()).toBeLessThan(0.6);
+    expect(session.solver.maxStrain()).toBeLessThan(0.35);
+  });
+
+  it('drapes on a real tracked front pose without severe stretch', () => {
+    const pose = frontPose.pose as BodyPose;
+    const garment = prepareTemplateGarment('M');
+    const session = new TryOnSession(garment, DEFAULT_PROFILE);
+    for (let f = 0; f < 240; f++) {
+      session.updatePose(pose);
+      session.step(1 / 60);
+    }
+    const { i, j, rest } = garment.mesh.stretch;
+    const x = session.solver.x;
+    const strains = Array.from(rest, (r, n) => (Math.hypot(x[i[n] * 3] - x[j[n] * 3], x[i[n] * 3 + 1] - x[j[n] * 3 + 1], x[i[n] * 3 + 2] - x[j[n] * 3 + 2]) - r) / r).sort((a, b) => a - b);
+    expect(strains[Math.floor(strains.length * 0.95)]).toBeLessThan(0.1);
+    expect(strains[Math.floor(strains.length * 0.99)]).toBeLessThan(0.2);
+    expect(strains[strains.length - 1]).toBeLessThan(0.45);
+  });
+
+  it('keeps each cuff around its arm through motion', () => {
+    const garment = prepareTemplateGarment('M');
+    const session = new TryOnSession(garment, DEFAULT_PROFILE);
+    for (let f = 0; f < 60 * 12; f++) {
+      const pose = syntheticPose(f / 60);
+      session.updatePose(pose);
+      session.step(1 / 60);
+      if (f % 30 !== 0) continue;
+      for (const [cuff, shoulder, elbow] of [[garment.mesh.openings.cuff_r, pose.ls, pose.le], [garment.mesh.openings.cuff_l, pose.rs, pose.re]] as const) {
+        // The arm is through the cuff exactly when the closed ring winds once around the arm axis.
+        const x = session.solver.x;
+        const length = Math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1], elbow[2] - shoulder[2]);
+        const axis = [(elbow[0] - shoulder[0]) / length, (elbow[1] - shoulder[1]) / length, (elbow[2] - shoulder[2]) / length];
+        const seed = Math.abs(axis[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+        const uRaw = [axis[1] * seed[2] - axis[2] * seed[1], axis[2] * seed[0] - axis[0] * seed[2], axis[0] * seed[1] - axis[1] * seed[0]];
+        const uLength = Math.hypot(uRaw[0], uRaw[1], uRaw[2]);
+        const u = uRaw.map((c) => c / uLength);
+        const w = [axis[1] * u[2] - axis[2] * u[1], axis[2] * u[0] - axis[0] * u[2], axis[0] * u[1] - axis[1] * u[0]];
+        const angles = Array.from(cuff, (v) => {
+          const d = [x[v * 3] - shoulder[0], x[v * 3 + 1] - shoulder[1], x[v * 3 + 2] - shoulder[2]];
+          return Math.atan2(d[0] * w[0] + d[1] * w[1] + d[2] * w[2], d[0] * u[0] + d[1] * u[1] + d[2] * u[2]);
+        });
+        let turned = 0;
+        angles.forEach((angle, n) => {
+          let delta = angles[(n + 1) % angles.length] - angle;
+          if (delta > Math.PI) delta -= 2 * Math.PI;
+          if (delta < -Math.PI) delta += 2 * Math.PI;
+          turned += delta;
+        });
+        expect(Math.abs(Math.round(turned / (2 * Math.PI))), `frame ${f}`).toBe(1);
+      }
+    }
   });
 
   it('fitGarment places the collar above the shoulder line', () => {

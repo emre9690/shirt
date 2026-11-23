@@ -230,6 +230,7 @@ export function assembleGarment(pattern: GarmentPattern, place: PlaceFn, options
   }
   const invMass = new Float32Array(simCount);
   for (let v = 0; v < simCount; v++) invMass[v] = mass[v] > 0 ? 1 / mass[v] : 0;
+  orientTriangles(triangles, renderTriangles, triRest, positions);
 
   const { stretch, bend } = buildConstraints(triangles, triRest, simCount, triPanel);
   const openings: Record<string, Uint32Array> = {};
@@ -253,6 +254,71 @@ export function assembleGarment(pattern: GarmentPattern, place: PlaceFn, options
 
   relaxToRest(positions, stretch, options.relaxIterations ?? 200);
   return { positions, invMass, triangles, triRest, stretch, bend, renderToSim, renderUv, renderTriangles, renderPanel, simSleeve, openings, seamVertexCount, arealDensity: density };
+}
+
+/**
+ * Give the sewn surface one consistent winding with normals facing out of the garment,
+ * so shading is continuous across seams and an inner and outer shell can be derived.
+ */
+function orientTriangles(triangles: Uint32Array, render: Uint32Array, rest: Float32Array, x: Float32Array): void {
+  const count = triangles.length / 3;
+  const vertexCount = x.length / 3;
+  const edgeKey = (a: number, b: number) => Math.min(a, b) * vertexCount + Math.max(a, b);
+  const byEdge = new Map<number, number[]>();
+  for (let t = 0; t < count; t++) {
+    for (let n = 0; n < 3; n++) {
+      const key = edgeKey(triangles[t * 3 + n], triangles[t * 3 + ((n + 1) % 3)]);
+      const list = byEdge.get(key);
+      if (list) list.push(t);
+      else byEdge.set(key, [t]);
+    }
+  }
+  const flip = (t: number) => {
+    for (const [array, base] of [[triangles, t * 3], [render, t * 3]] as const) {
+      const held = array[base + 1];
+      array[base + 1] = array[base + 2];
+      array[base + 2] = held;
+    }
+    for (let k = 0; k < 2; k++) {
+      const held = rest[t * 6 + 2 + k];
+      rest[t * 6 + 2 + k] = rest[t * 6 + 4 + k];
+      rest[t * 6 + 4 + k] = held;
+    }
+  };
+  const runsForward = (t: number, a: number, b: number) => {
+    for (let n = 0; n < 3; n++) if (triangles[t * 3 + n] === a && triangles[t * 3 + ((n + 1) % 3)] === b) return true;
+    return false;
+  };
+  const seen = new Uint8Array(count);
+  for (let seed = 0; seed < count; seed++) {
+    if (seen[seed]) continue;
+    seen[seed] = 1;
+    const queue = [seed];
+    while (queue.length) {
+      const t = queue.pop()!;
+      for (let n = 0; n < 3; n++) {
+        const a = triangles[t * 3 + n];
+        const b = triangles[t * 3 + ((n + 1) % 3)];
+        for (const other of byEdge.get(edgeKey(a, b))!) {
+          if (other === t || seen[other]) continue;
+          if (runsForward(other, a, b)) flip(other);
+          seen[other] = 1;
+          queue.push(other);
+        }
+      }
+    }
+  }
+  const centre = [0, 0, 0];
+  for (let v = 0; v < vertexCount; v++) for (let k = 0; k < 3; k++) centre[k] += x[v * 3 + k] / vertexCount;
+  let volume = 0;
+  for (let t = 0; t < count; t++) {
+    const [a, b, c] = [triangles[t * 3] * 3, triangles[t * 3 + 1] * 3, triangles[t * 3 + 2] * 3];
+    const p = [x[a] - centre[0], x[a + 1] - centre[1], x[a + 2] - centre[2]];
+    const q = [x[b] - centre[0], x[b + 1] - centre[1], x[b + 2] - centre[2]];
+    const r = [x[c] - centre[0], x[c + 1] - centre[1], x[c + 2] - centre[2]];
+    volume += p[0] * (q[1] * r[2] - q[2] * r[1]) - p[1] * (q[0] * r[2] - q[2] * r[0]) + p[2] * (q[0] * r[1] - q[1] * r[0]);
+  }
+  if (volume < 0) for (let t = 0; t < count; t++) flip(t);
 }
 
 /**

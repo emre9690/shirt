@@ -5,7 +5,7 @@ import type { PreparedGarment } from './runtime';
 const API = import.meta.env.VITE_PREPROCESS_URL ?? 'http://127.0.0.1:8765';
 
 interface GarmentCard { id: string; name: string; size: ShirtSize; method: string }
-interface ImportRecord { id: string; url: string | null; status: string; error: string | null; product: { name?: string; article?: string } }
+interface ImportRecord { id: string; url: string | null; status: string; error: string | null; product: { name?: string; article?: string }; images?: { id: string }[] }
 interface Job { id: string; garmentId: string; stage: string; status: string; error: string | null; blocked: boolean }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -66,8 +66,9 @@ export function GarmentLibrary({ size, selected, onSelect }: { size: ShirtSize; 
     setRecord(await api<ImportRecord>('/imports/upload', { method: 'POST', body: form }));
   });
 
-  const prepare = () => run(async () => {
-    setJob(await api<Job>('/garments/prepare', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ importId: record!.id, size, method: 'procedural-template' }) }));
+  const prepare = (method: 'procedural-template' | 'sewformer') => run(async () => {
+    const onModelImage = method === 'sewformer' ? record!.images?.[0]?.id : undefined;
+    setJob(await api<Job>('/garments/prepare', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ importId: record!.id, size, method, onModelImage }) }));
   });
 
   const load = (card: GarmentCard) => run(async () => {
@@ -89,7 +90,8 @@ export function GarmentLibrary({ size, selected, onSelect }: { size: ShirtSize; 
       </div>
       <label>Upload images <input aria-label="Upload images" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(e) => upload(e.target.files)} /></label>
       {record?.error && <small className="warn">{record.error}</small>}
-      {record && <button onClick={prepare}>Prepare template shirt, size {size}</button>}
+      {record && <button onClick={() => prepare('procedural-template')}>Prepare template shirt, size {size}</button>}
+      {record?.images?.length ? <button onClick={() => prepare('sewformer')}>Prepare with SewFormer, size {size}</button> : null}
       {job && <small role="status">Job: {job.status}, stage {job.stage}{job.error ? `. ${job.error}` : ''}</small>}
       {error && <small className="warn">{error}</small>}
       {garments.length > 0 && <strong>Prepared</strong>}

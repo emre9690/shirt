@@ -1,9 +1,9 @@
 import { assembleGarment, buildTShirtPattern, paramsForSize, tShirtPlacement, validateMesh, validatePattern, type GarmentMesh, type ShirtSize, type TShirtParams } from '@shirt/garment-schema';
 import { ClothSolver, ESTIMATED_JERSEY, type Capsule } from './physics/xpbd';
-import { bodyCapsules, collarAttachments, dist, fitGarment, JOINTS, lerpPose, openArmPose, shoulderLift, type BodyPose, type BodyProfile } from './tracking/body';
+import { armholeBlend, bodyCapsules, bodyFrame, bodyRadii, collarAttachments, dist, fitGarment, JOINTS, shoulderLift, type ArmholeBlend, type BodyPose, type BodyProfile, type P3 } from './tracking/body';
 
-const DRESSING_STEPS = 60;
-const DRESSING_DAMPING = 12;
+const SETTLE_ITERATIONS = 80;
+const SLEEVE_ROOT_WEIGHT = 0.95;
 
 export interface PreparedGarment {
   size: ShirtSize;
@@ -13,7 +13,7 @@ export interface PreparedGarment {
 
 const cache = new Map<string, PreparedGarment>();
 
-export function prepareTemplateGarment(size: ShirtSize, spacing = 0.03): PreparedGarment {
+export function prepareTemplateGarment(size: ShirtSize, spacing = 0.025): PreparedGarment {
   const id = `${size}:${spacing}`;
   const hit = cache.get(id);
   if (hit) return hit;
@@ -34,39 +34,56 @@ export const JUMP_THRESHOLD_M = 0.35;
 
 export class TryOnSession {
   readonly solver: ClothSolver;
+  private readonly blend: ArmholeBlend;
+  private readonly supportVertices: Uint32Array;
   capsules: Capsule[] = [];
   private lastPose: BodyPose | null = null;
   refits = 0;
 
   constructor(readonly garment: PreparedGarment, public profile: BodyProfile) {
     this.solver = new ClothSolver(garment.mesh, ESTIMATED_JERSEY);
+    this.blend = armholeBlend(garment.mesh);
+    this.supportVertices = garment.mesh.openings.neck;
+    this.solver.planeSide = Int8Array.from(this.blend.weight, (w, v) =>
+      garment.mesh.simSleeve[v] !== 0 && w < SLEEVE_ROOT_WEIGHT ? this.blend.side[v] : 0);
+    // The armhole seam sits inside the arm collider at the shoulder. If the sleeve root also
+    // collided with the arm, the seam and its neighbours would be forced apart.
+    this.solver.armSide = Int8Array.from(this.blend.weight, (w, v) => (w >= SLEEVE_ROOT_WEIGHT ? garment.mesh.simSleeve[v] : 0));
+  }
+
+  /** A flat limit beside the ribs. Unlike a capsule, it cannot push cloth out the wrong side. */
+  private updateArmpitPlanes(pose: BodyPose): void {
+    const frame = bodyFrame(pose);
+    const radii = bodyRadii(pose, this.profile);
+    this.solver.cuffFront = frame.z;
+    const half = radii.torsoOffset + radii.torso + this.solver.params.collisionOffset;
+    const offset = frame.origin[0] * frame.x[0] + frame.origin[1] * frame.x[1] + frame.origin[2] * frame.x[2];
+    const across = (q: P3) => q[0] * frame.x[0] + q[1] * frame.x[1] + q[2] * frame.x[2] - offset;
+    // The limit always stays inside the arm's inner edge, or the sleeve wall would be pinched
+    // between them. Arms held close or crossing the body move the limit inward.
+    const clearance = radii.upperArm + 2 * this.solver.params.collisionOffset;
+    const limitL = Math.min(half, across(pose.ls) - clearance, across(pose.le) - clearance);
+    const limitR = Math.min(half, -across(pose.rs) - clearance, -across(pose.re) - clearance);
+    this.solver.sidePlanes = {
+      1: { nx: frame.x[0], ny: frame.x[1], nz: frame.x[2], d: offset + limitL },
+      [-1]: { nx: -frame.x[0], ny: -frame.x[1], nz: -frame.x[2], d: -offset + limitR },
+    };
   }
 
   /** Place the garment on the body and clear all motion. */
   refit(pose: BodyPose): void {
     const { solver, garment } = this;
     const lift = shoulderLift(pose, this.profile);
-    // Dress the body the way a person does: arms start inside the open sleeves,
-    // then move to the tracked pose while the cloth simulates around them.
-    const open = openArmPose(pose, garment.params, lift);
-    fitGarment(garment.mesh.positions, garment.params, open, solver.x, lift);
+    // Each sleeve is laid along its tracked arm, so the arm starts inside the sleeve.
+    fitGarment(garment.mesh.positions, garment.params, pose, solver.x, lift, this.blend);
     solver.prev.set(solver.x);
     solver.v.fill(0);
-    solver.attachments = collarAttachments(garment.mesh.positions, garment.mesh.openings.neck, garment.params, pose, lift);
-    const start = bodyCapsules(open, this.profile);
-    solver.setColliders(start);
-    solver.setColliders(start);
-    const damping = solver.params.damping;
-    solver.params.damping = DRESSING_DAMPING;
-    for (let k = 1; k <= DRESSING_STEPS; k++) {
-      solver.setColliders(bodyCapsules(lerpPose(open, pose, k / DRESSING_STEPS), this.profile));
-      solver.advance(solver.params.fixedDt);
-    }
-    solver.params.damping = damping;
-    solver.v.fill(0);
-    solver.prev.set(solver.x);
+    solver.attachments = collarAttachments(garment.mesh.positions, this.supportVertices, garment.params, pose, lift);
     this.capsules = bodyCapsules(pose, this.profile);
     solver.setColliders(this.capsules);
+    solver.setColliders(this.capsules);
+    this.updateArmpitPlanes(pose);
+    solver.settle(SETTLE_ITERATIONS);
     this.lastPose = pose;
     this.refits++;
   }
@@ -78,7 +95,8 @@ export class TryOnSession {
     }
     this.capsules = bodyCapsules(pose, this.profile);
     this.solver.setColliders(this.capsules);
-    this.solver.attachments = collarAttachments(this.garment.mesh.positions, this.garment.mesh.openings.neck, this.garment.params, pose, shoulderLift(pose, this.profile));
+    this.updateArmpitPlanes(pose);
+    this.solver.attachments = collarAttachments(this.garment.mesh.positions, this.supportVertices, this.garment.params, pose, shoulderLift(pose, this.profile));
     this.lastPose = pose;
   }
 

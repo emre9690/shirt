@@ -11,7 +11,6 @@ DEFAULT_CHECKOUT = Path(os.environ.get("LOCALAPPDATA", "")) / "shirt-tools" / "s
 CHECKPOINT = "Detr2d-V6-final-dif-ce-focal-schd-agp_checkpoint_37.pth"
 RUNNER = Path(__file__).resolve().parents[1] / "sewformer_runner.py"
 CURVE_SAMPLES = 12
-NON_TSHIRT_PREFIXES = ("skirt_", "pant_", "hood_", "wb_")
 SLEEVE_PAIRS = {"+x": ("sleeve_lf", "sleeve_lb"), "-x": ("sleeve_rf", "sleeve_rb")}
 
 
@@ -80,7 +79,17 @@ def normalize_prediction(raw: dict) -> dict:
         seams.append({"a": {"panel": a[0], "edge": str(a[1])}, "b": {"panel": b[0], "edge": str(b[1])}})
 
     names = {p["id"] for p in panels}
-    unexpected = sorted(n for n in names if n.startswith(NON_TSHIRT_PREFIXES) or n == "top_front_left")
+    # Photos show whole outfits, so separate garments such as trousers are allowed.
+    # Anything sewn to the top, as in a dress or hoodie, means the top is not a T-shirt.
+    shirt_panels = {"top_front", "top_back", *SLEEVE_PAIRS["+x"], *SLEEVE_PAIRS["-x"]}
+    attached = sorted({
+        side["panel"] for seam in seams for side in (seam["a"], seam["b"])
+        if side["panel"] not in shirt_panels and ({seam["a"]["panel"], seam["b"]["panel"]} & shirt_panels)
+    })
+    unexpected = sorted(set(attached) | {n for n in names if n.startswith("hood_") or n == "top_front_left"})
+    other_garments = sorted(names - shirt_panels - set(unexpected))
+    if other_garments:
+        warnings.append("Ignored separate garment panels: " + ", ".join(other_garments))
     missing = [n for n in ("top_front", "top_back") if n not in names]
     missing_sleeves = [side for side, pair in SLEEVE_PAIRS.items() if not set(pair) <= names]
     is_tshirt = not unexpected and not missing and not missing_sleeves
@@ -96,6 +105,107 @@ def normalize_prediction(raw: dict) -> dict:
     if not seams:
         errors.append("Prediction has no seams")
     return {"panels": panels, "seams": seams, "openEdges": open_edges, "errors": errors, "warnings": warnings, "isTShirt": is_tshirt}
+
+
+def _panel(normalized: dict, name: str) -> dict:
+    return next(p for p in normalized["panels"] if p["id"] == name)
+
+
+def _body_features(panel: dict) -> dict:
+    """Measure a front or back panel from its corners and neckline curve, in predicted metres."""
+    corners = [edge["points"][0] for edge in panel["edges"]]
+    ys = [p[1] for p in corners]
+    bottom, height = min(ys), max(ys) - min(ys)
+    if height <= 0:
+        raise ValueError(f"{panel['id']}: panel has no height")
+    top = sorted((p for p in corners if p[1] > bottom + 0.8 * height), key=lambda p: p[0])
+    if len(top) < 4:
+        raise ValueError(f"{panel['id']}: could not find shoulders and neckline")
+    hem = sorted(corners, key=lambda p: p[1])[:2]
+    middle = [p for p in corners if p not in top and p not in hem]
+    if len(middle) < 2:
+        raise ValueError(f"{panel['id']}: could not find both underarm points")
+    chest = max(p[0] for p in middle) - min(p[0] for p in middle)
+    shoulder_y = (top[0][1] + top[-1][1]) / 2
+    neck_left, neck_right = top[1], top[-2]
+    neck_y = (neck_left[1] + neck_right[1]) / 2
+    curve = [q for edge in panel["edges"] for q in edge["points"] if neck_left[0] < q[0] < neck_right[0] and q[1] > bottom + 0.6 * height]
+    lowest_neck = min((q[1] for q in curve), default=neck_y)
+    return {
+        "height": height,
+        "chest": chest,
+        "shoulder": top[-1][0] - top[0][0],
+        "neckWidth": neck_right[0] - neck_left[0],
+        "neckDepth": max(0.0, neck_y - lowest_neck),
+        "armhole": shoulder_y - sum(p[1] for p in middle) / len(middle),
+    }
+
+
+def _sleeve_features(normalized: dict) -> dict:
+    """Average length and cuff width of the sleeve halves, using seams to find each cuff."""
+    lengths, cuffs = [], []
+    for pair in SLEEVE_PAIRS.values():
+        for name in pair:
+            panel = _panel(normalized, name)
+            if len(panel["edges"]) != 4:
+                continue
+            armhole = next((
+                int(side["edge"]) for seam in normalized["seams"] for side, other in ((seam["a"], seam["b"]), (seam["b"], seam["a"]))
+                if side["panel"] == name and other["panel"] in ("top_front", "top_back")
+            ), None)
+            if armhole is None:
+                continue
+            cuff = panel["edges"][(armhole + 2) % 4]["points"]
+            root = panel["edges"][armhole]["points"]
+            middle = lambda points: [(points[0][0] + points[-1][0]) / 2, (points[0][1] + points[-1][1]) / 2]
+            cuff_mid, root_mid = middle(cuff), middle(root)
+            lengths.append(math.dist(cuff_mid, root_mid))
+            cuffs.append(math.dist(cuff[0], cuff[-1]))
+    if len(lengths) < 2:
+        raise ValueError("Could not identify sleeve cuffs from the predicted seams")
+    return {"length": sum(lengths) / len(lengths), "cuff": sum(cuffs) / len(cuffs), "samples": len(lengths)}
+
+
+# Plausible limits for an adult short-sleeved T-shirt, in metres. Predictions outside are clamped and reported.
+FIT_LIMITS = {
+    "shoulderWidth": (0.34, 0.62), "neckWidth": (0.13, 0.22), "neckDepthFront": (0.05, 0.12),
+    "neckDepthBack": (0.01, 0.04), "armholeDepth": (0.18, 0.32), "sleeveLength": (0.14, 0.30), "sleeveOpening": (0.15, 0.27),
+}
+
+
+def fit_template_params(normalized: dict, published_width_m: float, published_length_m: float) -> dict:
+    """
+    Convert predicted proportions into garment dimensions at the published size.
+    SewFormer's absolute scale is not trusted, so only its ratios are used. The result is a
+    SewFormer-guided template, not a direct reconstruction of the predicted panels.
+    """
+    if not normalized.get("isTShirt"):
+        raise ValueError("Prediction is not a T-shirt")
+    front = _body_features(_panel(normalized, "top_front"))
+    back = _body_features(_panel(normalized, "top_back"))
+    sleeve = _sleeve_features(normalized)
+    chest = (front["chest"] + back["chest"]) / 2
+    height = (front["height"] + back["height"]) / 2
+    if chest <= 0:
+        raise ValueError("Predicted chest width is not positive")
+    width_scale = published_width_m / chest
+    length_scale = published_length_m / height
+    raw = {
+        "shoulderWidth": (front["shoulder"] + back["shoulder"]) / 2 * width_scale,
+        "neckWidth": (front["neckWidth"] + back["neckWidth"]) / 2 * width_scale,
+        "neckDepthFront": front["neckDepth"] * length_scale,
+        "neckDepthBack": back["neckDepth"] * length_scale,
+        "armholeDepth": (front["armhole"] + back["armhole"]) / 2 * length_scale,
+        "sleeveLength": sleeve["length"] * length_scale,
+        "sleeveOpening": sleeve["cuff"] * width_scale,
+    }
+    params, clamped = {}, []
+    for key, value in raw.items():
+        low, high = FIT_LIMITS[key]
+        params[key] = round(min(high, max(low, value)), 4)
+        if params[key] != round(value, 4):
+            clamped.append(f"{key}: predicted {value:.3f} m, limited to {params[key]:.3f} m")
+    return {"params": params, "predicted": {k: round(v, 4) for k, v in raw.items()}, "clamped": clamped, "sleeveSamples": sleeve["samples"]}
 
 
 def check_installation(checkout: Path = DEFAULT_CHECKOUT) -> str | None:

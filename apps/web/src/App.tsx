@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { HM_PUBLISHED_SIZES_CM, type ShirtSize } from '@shirt/garment-schema';
 import { GarmentView } from './rendering/garmentView';
 import { GarmentLibrary } from './GarmentLibrary';
-import { prepareTemplateGarment, StageTimer, TryOnSession, type PreparedGarment } from './runtime';
+import { PhysicsClient } from './physics/client';
+import { prepareTemplateGarment, StageTimer, type PreparedGarment } from './runtime';
 import { OneEuroVector } from './tracking/oneEuro';
 import { createPoseTracker, type PoseTracker } from './tracking/pose';
 import {
@@ -15,7 +16,7 @@ type Tracking = 'none' | 'good' | 'weak' | 'lost';
 
 interface Stats {
   renderFps: number; poseFps: number; poseP95: number; physicsP50: number; physicsP95: number; renderP95: number;
-  strain: number; vertices: number; delegate: string; dropped: number; refits: number;
+  strain: number; vertices: number; delegate: string; dropped: number; refits: number; physicsPath: string;
 }
 
 const SIZES = Object.keys(HM_PUBLISHED_SIZES_CM) as ShirtSize[];
@@ -34,7 +35,7 @@ export function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<GarmentView | null>(null);
-  const sessionRef = useRef<TryOnSession | null>(null);
+  const sessionRef = useRef<PhysicsClient | null>(null);
   const trackerRef = useRef<PoseTracker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef(0);
@@ -67,6 +68,7 @@ export function App() {
     if (videoRef.current) videoRef.current.srcObject = null;
     trackerRef.current?.close();
     trackerRef.current = null;
+    sessionRef.current?.dispose();
     sessionRef.current = null;
     viewRef.current?.setOpacity(0);
     viewRef.current?.render();
@@ -89,7 +91,8 @@ export function App() {
     const view = ensureView();
     view.setGarment(prepared.mesh);
     view.setOptions(optsRef.current);
-    sessionRef.current = new TryOnSession(prepared, profileRef.current);
+    sessionRef.current?.dispose();
+    sessionRef.current = new PhysicsClient(prepared, profileRef.current);
     return sessionRef.current;
   };
 
@@ -121,14 +124,13 @@ export function App() {
       const lost = now - lastGood > LOST_AFTER_MS;
       if (lost) session.markTrackingLost();
       else {
-        const t0 = performance.now();
         session.step(dt);
-        physics.add(performance.now() - t0);
+        physics.add(session.stepMs);
       }
-      const ready = modeRef.current === 'live' || modeRef.current === 'demo';
+      const ready = (modeRef.current === 'live' || modeRef.current === 'demo') && session.ready;
       opacity += ((ready && !lost ? 1 : 0) - opacity) * Math.min(1, dt * 10);
       view.setOpacity(opacity);
-      view.updateCloth(session.solver.x);
+      view.updateCloth(session.x);
       const t1 = performance.now();
       view.render();
       draw.add(performance.now() - t1);
@@ -139,7 +141,7 @@ export function App() {
         setStats({
           renderFps: frames / seconds, poseFps: p.count / seconds, poseP95: p.timer.percentile(0.95),
           physicsP50: physics.percentile(0.5), physicsP95: physics.percentile(0.95), renderP95: draw.percentile(0.95),
-          strain: session.solver.maxStrain(), vertices: session.solver.n, delegate, dropped, refits: session.refits,
+          strain: session.strain, vertices: session.n, delegate, dropped, refits: session.refits, physicsPath: session.mode,
         });
         frames = 0;
         statClock = now;
@@ -203,6 +205,7 @@ export function App() {
         const pose = {} as BodyPose;
         JOINTS.forEach((j, i) => { pose[j] = [smooth[i * 3], smooth[i * 3 + 1], smooth[i * 3 + 2]] as P3; });
         const fit = fitImage(pose, result.image, video.videoWidth, video.videoHeight);
+        if (import.meta.env.DEV) (window as unknown as { __tryonDebug: unknown }).__tryonDebug = { pose, fit };
         return fit ? { pose, fit } : null;
       };
       runLoop(getPose, tracker.delegate, video.videoWidth, video.videoHeight);
@@ -282,7 +285,7 @@ export function App() {
             {stats && <pre data-testid="stats">{[
               `render ${stats.renderFps.toFixed(0)} fps | pose ${stats.poseFps.toFixed(0)} fps`,
               `pose p95 ${stats.poseP95.toFixed(1)} ms (${stats.delegate})`,
-              `physics p50/p95 ${stats.physicsP50.toFixed(1)}/${stats.physicsP95.toFixed(1)} ms`,
+              `physics p50/p95 ${stats.physicsP50.toFixed(1)}/${stats.physicsP95.toFixed(1)} ms (${stats.physicsPath})`,
               `draw p95 ${stats.renderP95.toFixed(1)} ms`,
               `verts ${stats.vertices} | strain ${(stats.strain * 100).toFixed(1)}%`,
               `slow frames ${stats.dropped} | refits ${stats.refits}`,

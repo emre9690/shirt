@@ -1,6 +1,7 @@
 """One local background worker. Expensive subprocesses never run in a request handler."""
 from __future__ import annotations
 
+import json
 import queue
 import shutil
 import subprocess
@@ -9,8 +10,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .sewformer_adapter import check_installation, run_inference
+from .sewformer_adapter import check_installation, fit_template_params, run_inference
 from .store import Store, cache_key
+
+# H&M article 0685816001, Indian listing. Width's meaning is an unverified assumption (circumference).
+PUBLISHED_SIZES_CM = {"XS": (94, 68), "S": (102, 70), "M": (110, 71), "L": (118, 73), "XL": (126, 74), "XXL": (134, 75)}
 
 STAGES = ["imported", "images_selected", "pattern_inferred", "mesh_assembled", "asset_validated", "ready"]
 TEMPLATE_SIZES = {"XS", "S", "M", "L", "XL", "XXL"}
@@ -31,11 +35,12 @@ def node_exporter(spec: dict, out_dir: Path) -> None:
         raise Blocked("Node.js is not on PATH, so the garment exporter cannot run.")
     if not EXPORTER.exists():
         raise Blocked("Garment exporter is not built. Run: npm run build:tools")
-    result = subprocess.run(
-        [node, str(EXPORTER), "--size", spec["size"], "--out", str(out_dir), "--name", spec["name"],
-         "--article", spec["article"], "--method", spec["method"], "--source", spec.get("source") or ""],
-        capture_output=True, text=True, timeout=120,
-    )
+    command = [node, str(EXPORTER), "--size", spec["size"], "--out", str(out_dir), "--name", spec["name"],
+               "--article", spec["article"], "--method", spec.get("exportMethod", spec["method"]),
+               "--source", spec.get("source") or ""]
+    if spec.get("paramsFile"):
+        command += ["--params-file", spec["paramsFile"]]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"Exporter failed: {result.stderr.strip()[-600:]}")
 
@@ -51,10 +56,17 @@ def sewformer_step(spec: dict, out_dir: Path) -> None:
     normalized = run_inference(Path(image), out_dir / "sewformer")
     if normalized["errors"]:
         raise RuntimeError("SewFormer prediction rejected: " + "; ".join(normalized["errors"][:6]))
-    raise Blocked(
-        "SewFormer produced a valid T-shirt pattern, but the bridge from its panels to a simulated "
-        "runtime garment is not implemented yet. No garment was created."
-    )
+    width_cm, length_cm = PUBLISHED_SIZES_CM[spec["size"]]
+    try:
+        fit = fit_template_params(normalized, width_cm / 200, length_cm / 100)
+    except ValueError as exc:
+        raise RuntimeError(f"Could not measure the SewFormer prediction: {exc}") from exc
+    fit["run"] = normalized["run"]
+    fit["warnings"] = normalized["warnings"]
+    fit_path = out_dir / "sewformer_fit.json"
+    fit_path.write_text(json.dumps(fit, indent=2), encoding="utf-8")
+    spec["paramsFile"] = str(fit_path)
+    spec["exportMethod"] = "sewformer-guided-template"
 
 
 class JobRunner:

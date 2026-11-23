@@ -1,4 +1,4 @@
-import type { TShirtParams } from '@shirt/garment-schema';
+import type { GarmentMesh, TShirtParams } from '@shirt/garment-schema';
 import type { Attachment, Capsule } from '../physics/xpbd';
 
 /**
@@ -108,9 +108,12 @@ export function bodyRadii(pose: BodyPose, profile: BodyProfile): BodyRadii {
   return { torso, torsoOffset, upperArm: 0.048 * scale, foreArm: 0.038 * scale };
 }
 
+const SHOULDER_BAR_RATIO = 0.6;
+
 /** Height of the shoulder seam above the shoulder joint centre. */
 export function shoulderLift(p: BodyPose, profile: BodyProfile): number {
-  return bodyRadii(p, profile).upperArm * 1.1 + 0.012;
+  // The pose landmark is the joint, only a few centimetres below the top of the shoulder.
+  return bodyRadii(p, profile).upperArm * SHOULDER_BAR_RATIO + 0.006;
 }
 
 export function bodyCapsules(p: BodyPose, profile: BodyProfile): Capsule[] {
@@ -118,7 +121,8 @@ export function bodyCapsules(p: BodyPose, profile: BodyProfile): Capsule[] {
   const r = bodyRadii(p, profile);
   const hip = mid(p.lh, p.rh);
   const down = dist(f.origin, hip);
-  const topY = -r.torso * 0.75;
+  // The torso's top stays under the shoulder line so the seam settles on the shoulder bar.
+  const topY = -r.torso - 0.01;
   const bottomY = -down;
   const shoulderInset = r.upperArm * 0.6;
   const ls = add(p.ls, mul(f.x, -shoulderInset));
@@ -126,9 +130,9 @@ export function bodyCapsules(p: BodyPose, profile: BodyProfile): Capsule[] {
   // The wearer's left arm is on +x, which is the garment's `sleeve_r` (simSleeve +1).
   const arm = (a: P3, b: P3, radius: number, sleeveSide: 1 | -1, minT?: number): Capsule => ({ ...capsule(a, b, radius), sleeveSide, minT });
   return [
-    capsule(toWorld(f, r.torsoOffset, topY, 0), toWorld(f, r.torsoOffset, bottomY, 0), r.torso),
-    capsule(toWorld(f, -r.torsoOffset, topY, 0), toWorld(f, -r.torsoOffset, bottomY, 0), r.torso),
-    { ...capsule(ls, rs, r.upperArm * 1.1), occludes: false },
+    { ...capsule(toWorld(f, r.torsoOffset, topY, 0), toWorld(f, r.torsoOffset, bottomY, 0), r.torso), bodyPanelsOnly: true },
+    { ...capsule(toWorld(f, -r.torsoOffset, topY, 0), toWorld(f, -r.torsoOffset, bottomY, 0), r.torso), bodyPanelsOnly: true },
+    { ...capsule(ls, rs, r.upperArm * SHOULDER_BAR_RATIO), occludes: false },
     { ...arm(ls, p.le, r.upperArm, 1, 0.25), occludes: false },
     arm(p.le, p.lw, r.foreArm, 1),
     { ...arm(rs, p.re, r.upperArm, -1, 0.25), occludes: false },
@@ -140,41 +144,92 @@ export function bodyCapsules(p: BodyPose, profile: BodyProfile): Capsule[] {
  * Rigidly carry the rest garment onto the body, rotating each sleeve toward its arm.
  * Dimensions are never scaled to the wearer: a selected size stays that size.
  */
-export function fitGarment(rest: Float32Array, garment: TShirtParams, p: BodyPose, out: Float32Array, lift = 0.07): void {
+export function fitGarment(rest: Float32Array, garment: TShirtParams, p: BodyPose, out: Float32Array, lift = 0.07, blend?: ArmholeBlend): void {
   const f = bodyFrame(p);
   // The shoulder seam rests on top of the shoulder collider, not through the joint centre.
   const shoulderY = garment.bodyLength - garment.shoulderDrop - lift;
+  const cuffX = garment.shoulderWidth / 2 + garment.sleeveLength;
+  const sleeveY = lift - garment.armholeDepth / 2;
+  const toLocal = (q: P3): P3 => {
+    const d = sub(q, f.origin);
+    return [dot(d, f.x), dot(d, f.y), dot(d, f.z)];
+  };
+  /**
+   * Swing the sleeve about the top of the armhole, where the shoulder seam ends, so that seam
+   * keeps its length. The cuff centre lands on the tracked arm at its original distance.
+   */
+  const swing = (side: number, shoulder: P3, elbow: P3) => {
+    const pivot: P3 = [side * garment.shoulderWidth / 2, lift, 0];
+    const cuff: P3 = [side * cuffX, sleeveY, 0];
+    const reach = dist(pivot, cuff);
+    const joint = toLocal(shoulder);
+    const arm = norm(sub(toLocal(elbow), joint));
+    const offset = sub(joint, pivot);
+    const along = dot(offset, arm);
+    const tau = -along + Math.sqrt(Math.max(0, along * along - dot(offset, offset) + reach * reach));
+    const from = norm(sub(cuff, pivot));
+    const to = norm(sub(add(joint, mul(arm, tau)), pivot));
+    const axis = cross(from, to);
+    const sine = Math.hypot(axis[0], axis[1], axis[2]);
+    return { pivot, axis: sine > 1e-6 ? mul(axis, 1 / sine) : ([0, 0, 1] as P3), angle: Math.atan2(sine, dot(from, to)) };
+  };
+  const swings = { 1: swing(1, p.ls, p.le), [-1]: swing(-1, p.rs, p.re) } as Record<number, ReturnType<typeof swing>>;
   for (let v = 0; v < rest.length / 3; v++) {
-    const q = toWorld(f, rest[v * 3], rest[v * 3 + 1] - shoulderY, rest[v * 3 + 2]);
+    let local: P3 = [rest[v * 3], rest[v * 3 + 1] - shoulderY, rest[v * 3 + 2]];
+    const weight = blend?.weight[v] ?? 0;
+    if (weight > 0) {
+      const { pivot, axis, angle } = swings[blend!.side[v]];
+      const d = sub(local, pivot);
+      const c = Math.cos(angle * weight);
+      const s = Math.sin(angle * weight);
+      // Rodrigues rotation, partially applied so the cloth bends smoothly over the shoulder.
+      local = add(pivot, add(add(mul(d, c), mul(cross(axis, d), s)), mul(axis, dot(axis, d) * (1 - c))));
+    }
+    const q = toWorld(f, local[0], local[1], local[2]);
     out[v * 3] = q[0];
     out[v * 3 + 1] = q[1];
     out[v * 3 + 2] = q[2];
   }
 }
 
-/** Same torso, with both arms held out along the garment's open sleeve axes. */
-export function openArmPose(p: BodyPose, garment: TShirtParams, lift: number): BodyPose {
-  const f = bodyFrame(p);
-  const sleeveY = lift - garment.armholeDepth / 2;
-  const reach = (shoulder: P3, elbow: P3, wrist: P3, side: number): [P3, P3] => {
-    const local = dot(sub(shoulder, f.origin), f.x);
-    const upper = dist(shoulder, elbow);
-    const fore = dist(elbow, wrist);
-    return [toWorld(f, local + side * upper, sleeveY, 0), toWorld(f, local + side * (upper + fore), sleeveY, 0)];
-  };
-  const [le, lw] = reach(p.ls, p.le, p.lw, 1);
-  const [re, rw] = reach(p.rs, p.re, p.rw, -1);
-  return { ...p, le, lw, re, rw };
+export interface ArmholeBlend {
+  /** 0 on the body, 0.5 at the armhole seam, 1 along the sleeve. */
+  weight: Float32Array;
+  /** Which shoulder drives this vertex: +1 is the garment's +x side. */
+  side: Int8Array;
 }
 
-export function lerpPose(a: BodyPose, b: BodyPose, t: number): BodyPose {
-  const out = {} as BodyPose;
-  for (const j of JOINTS) out[j] = add(mul(a[j], 1 - t), mul(b[j], t));
-  return out;
+/** Blend weights from each vertex's distance along the cloth to its nearest armhole seam. */
+export function armholeBlend(mesh: GarmentMesh, radius = 0.07): ArmholeBlend {
+  const n = mesh.positions.length / 3;
+  const { i, j, rest } = mesh.stretch;
+  const distance = new Float32Array(n).fill(Infinity);
+  const side = new Int8Array(n);
+  for (let e = 0; e < rest.length; e++) {
+    const [a, b] = [i[e], j[e]];
+    if (mesh.simSleeve[a] === 0 && mesh.simSleeve[b] !== 0) { distance[a] = 0; side[a] = mesh.simSleeve[b]; }
+    if (mesh.simSleeve[b] === 0 && mesh.simSleeve[a] !== 0) { distance[b] = 0; side[b] = mesh.simSleeve[a]; }
+  }
+  for (let changed = true; changed;) {
+    changed = false;
+    for (let e = 0; e < rest.length; e++) {
+      const [a, b] = [i[e], j[e]];
+      if (distance[a] + rest[e] < distance[b] - 1e-6) { distance[b] = distance[a] + rest[e]; side[b] = side[a]; changed = true; }
+      if (distance[b] + rest[e] < distance[a] - 1e-6) { distance[a] = distance[b] + rest[e]; side[a] = side[b]; changed = true; }
+    }
+  }
+  const weight = new Float32Array(n);
+  for (let v = 0; v < n; v++) {
+    const t = Math.min(1, distance[v] / radius);
+    const smooth = t * t * (3 - 2 * t);
+    weight[v] = mesh.simSleeve[v] !== 0 ? 0.5 + 0.5 * smooth : 0.5 - 0.5 * smooth;
+    if (side[v] === 0) { side[v] = 1; weight[v] = 0; }
+  }
+  return { weight, side };
 }
 
 /** Sparse, compliant collar support. Everything below the neckband hangs freely. */
-export function collarAttachments(rest: Float32Array, neck: Uint32Array, garment: TShirtParams, p: BodyPose, lift = 0.07, compliance = 2e-6): Attachment[] {
+export function collarAttachments(rest: Float32Array, neck: Uint32Array, garment: TShirtParams, p: BodyPose, lift = 0.07, compliance = 2e-2): Attachment[] {
   const f = bodyFrame(p);
   const shoulderY = garment.bodyLength - garment.shoulderDrop - lift;
   return Array.from(neck, (index) => {

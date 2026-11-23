@@ -11,16 +11,24 @@ export interface Capsule {
    * hides the resulting overlap.
    */
   sleeveSide?: 1 | -1;
-  /** Ignore contacts nearer the capsule start than this fraction (the armhole region). */
+  /** Set on the upper-arm capsule, the one each cuff encircles. */
   minT?: number;
+  /** Torso capsules apply only to vertices flagged in the solver's `torsoContact` mask. */
+  bodyPanelsOnly?: boolean;
   /** False for parts that sit inside the garment and must not cut holes in it when drawn. */
   occludes?: boolean;
 }
+
+// Tight enough that a ring of this circumference cannot slide entirely to one side of the arm.
+const CUFF_SLACK = 1.12;
+const CUFF_RING_GAIN = 0.08;
 
 export interface SolverParams {
   gravity: number;
   /** XPBD compliance in m/N-style units; independent of timestep. */
   stretchCompliance: number;
+  /** Woven and knit cloth buckles instead of resisting compression, so this is much softer. */
+  compressCompliance: number;
   bendCompliance: number;
   /** Velocity decay rate, 1/s. */
   damping: number;
@@ -36,13 +44,14 @@ export interface SolverParams {
 export const ESTIMATED_JERSEY: SolverParams = {
   gravity: 9.81,
   stretchCompliance: 1e-7,
+  compressCompliance: 0.5,
   // Vertex inverse masses are ~1e4 per kg, so compliance must be large for bending to stay soft.
   bendCompliance: 1,
   damping: 1.2,
   friction: 0.35,
   collisionOffset: 0.006,
   fixedDt: 1 / 60,
-  substeps: 8,
+  substeps: 16,
   maxStepsPerFrame: 3,
   maxSpeed: 12,
 };
@@ -61,6 +70,15 @@ export class ClothSolver {
   readonly rest: Float32Array;
   params: SolverParams;
   attachments: Attachment[] = [];
+  /** 1 where cloth rests on the torso. Outer sleeve rides on the arm instead. */
+  torsoContact: Uint8Array;
+  /** Unit direction out of the wearer's chest, used to keep each cuff from twisting. */
+  cuffFront: [number, number, number] = [0, 0, 1];
+  /** Which arm a vertex collides with: +1, -1, or 0 for none. */
+  armSide: Int8Array;
+  /** Sleeve-root vertices kept on the outer side of a plane beside the ribs: +1, -1, or 0 for none. */
+  planeSide: Int8Array;
+  sidePlanes: Partial<Record<number, { nx: number; ny: number; nz: number; d: number }>> = {};
   resets = 0;
   droppedTime = 0;
   private accumulator = 0;
@@ -68,6 +86,7 @@ export class ClothSolver {
   private toCapsules: Capsule[] = [];
   private current: Capsule[] = [];
   private previous: Capsule[] = [];
+  private cuffRadii = new Map<Uint32Array, number>();
 
   constructor(private mesh: GarmentMesh, params: SolverParams = ESTIMATED_JERSEY) {
     this.n = mesh.positions.length / 3;
@@ -76,6 +95,9 @@ export class ClothSolver {
     this.rest = mesh.positions.slice();
     this.v = new Float32Array(this.n * 3);
     this.params = { ...params };
+    this.torsoContact = Uint8Array.from(mesh.simSleeve, (side) => (side === 0 ? 1 : 0));
+    this.planeSide = new Int8Array(this.n);
+    this.armSide = mesh.simSleeve.slice();
   }
 
   /** New collider targets; motion is interpolated across the next fixed step. */
@@ -137,17 +159,24 @@ export class ClothSolver {
         x[k + 1] += dy;
         x[k + 2] += dz;
       }
-      this.solveDistance(this.mesh.stretch, this.params.stretchCompliance / (h * h));
-      this.solveDistance(this.mesh.bend, this.params.bendCompliance / (h * h));
-      this.solveAttachments(h);
-      this.solveCollisions();
+      this.solveDistance(this.mesh.stretch, this.params.stretchCompliance / (h * h), this.params.compressCompliance / (h * h));
+      // Stretch needs every substep to converge. The rest run at half rate, with compliance
+      // scaled to their longer timestep so stiffness does not change.
+      if (s % 2 === 1) {
+        const coarse = 2 * h;
+        this.solveDistance(this.mesh.bend, this.params.bendCompliance / (coarse * coarse));
+        this.solveAttachments(coarse);
+        this.solveCollisions();
+        this.solveSidePlanes();
+        this.solveCuffs();
+      }
       for (let k = 0; k < this.n * 3; k++) v[k] = (x[k] - prev[k]) / h;
     }
     if (!this.isHealthy()) this.reset();
   }
 
   /** One small-step XPBD iteration: lambda starts at zero, so alpha-tilde = compliance / h^2. */
-  private solveDistance(c: GarmentMesh['stretch'], alpha: number): void {
+  private solveDistance(c: GarmentMesh['stretch'], alpha: number, compressAlpha = alpha): void {
     const { x } = this;
     const w = this.mesh.invMass;
     for (let n = 0; n < c.rest.length; n++) {
@@ -160,7 +189,8 @@ export class ClothSolver {
       const dz = x[a + 2] - x[b + 2];
       const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
       if (len < 1e-9) continue;
-      const lambda = -(len - c.rest[n]) / (wSum + alpha);
+      const error = len - c.rest[n];
+      const lambda = -error / (wSum + (error < 0 ? compressAlpha : alpha));
       const px = (lambda * dx) / len;
       const py = (lambda * dy) / len;
       const pz = (lambda * dz) / len;
@@ -219,10 +249,10 @@ export class ClothSolver {
       const radius = cap.r + collisionOffset;
       for (let i = 0; i < this.n; i++) {
         if (w[i] === 0) continue;
-        if (cap.sleeveSide !== undefined && this.mesh.simSleeve[i] !== cap.sleeveSide) continue;
+        if (cap.sleeveSide !== undefined && this.armSide[i] !== cap.sleeveSide) continue;
+        if (cap.bodyPanelsOnly && !this.torsoContact[i]) continue;
         const k = i * 3;
         const t = Math.max(0, Math.min(1, ((x[k] - cap.ax) * abx + (x[k + 1] - cap.ay) * aby + (x[k + 2] - cap.az) * abz) / abLen2));
-        if (cap.minT !== undefined && t < cap.minT) continue;
         const qx = cap.ax + abx * t;
         const qy = cap.ay + aby * t;
         const qz = cap.az + abz * t;
@@ -266,14 +296,106 @@ export class ClothSolver {
     }
   }
 
+  private solveSidePlanes(): void {
+    const { x, planeSide } = this;
+    for (let i = 0; i < this.n; i++) {
+      if (planeSide[i] === 0) continue;
+      const plane = this.sidePlanes[planeSide[i]];
+      if (!plane) continue;
+      const k = i * 3;
+      const depth = plane.d - (x[k] * plane.nx + x[k + 1] * plane.ny + x[k + 2] * plane.nz);
+      if (depth <= 0) continue;
+      x[k] += plane.nx * depth;
+      x[k + 1] += plane.ny * depth;
+      x[k + 2] += plane.nz * depth;
+    }
+  }
+
+  /** A cuff is a closed ring around the arm, so it can never move farther away than its radius. */
+  private solveCuffs(): void {
+    const { x } = this;
+    for (const cap of this.current) {
+      if (cap.minT === undefined || cap.sleeveSide === undefined) continue;
+      const cuff = this.mesh.openings[cap.sleeveSide > 0 ? 'cuff_r' : 'cuff_l'];
+      if (!cuff) continue;
+      const maxDistance = this.cuffRadius(cuff) * CUFF_SLACK;
+      const abx = cap.bx - cap.ax;
+      const aby = cap.by - cap.ay;
+      const abz = cap.bz - cap.az;
+      const abLen2 = abx * abx + aby * aby + abz * abz || 1e-12;
+
+      // Gently hold each cuff vertex at its own angle around the arm, so the closed ring
+      // cannot slide off to one side and leave the arm poking through the sleeve wall.
+      let [mx, my, mz] = [0, 0, 0];
+      for (const v of cuff) {
+        mx += x[v * 3] / cuff.length;
+        my += x[v * 3 + 1] / cuff.length;
+        mz += x[v * 3 + 2] / cuff.length;
+      }
+      const tm = Math.max(0, Math.min(1, ((mx - cap.ax) * abx + (my - cap.ay) * aby + (mz - cap.az) * abz) / abLen2));
+      const [cx, cy, cz] = [cap.ax + abx * tm, cap.ay + aby * tm, cap.az + abz * tm];
+      const abLen = Math.sqrt(abLen2);
+      const axis = [abx / abLen, aby / abLen, abz / abLen];
+      const along = this.cuffFront[0] * axis[0] + this.cuffFront[1] * axis[1] + this.cuffFront[2] * axis[2];
+      const rawFront = [this.cuffFront[0] - axis[0] * along, this.cuffFront[1] - axis[1] * along, this.cuffFront[2] - axis[2] * along];
+      const frontLength = Math.hypot(rawFront[0], rawFront[1], rawFront[2]);
+      if (frontLength > 0.05) {
+        const front = rawFront.map((c) => c / frontLength);
+        const up = [
+          cap.sleeveSide * (front[1] * axis[2] - front[2] * axis[1]),
+          cap.sleeveSide * (front[2] * axis[0] - front[0] * axis[2]),
+          cap.sleeveSide * (front[0] * axis[1] - front[1] * axis[0]),
+        ];
+        const radius = this.cuffRadius(cuff);
+        cuff.forEach((v, index) => {
+          const theta = -Math.PI + (2 * Math.PI * index) / cuff.length;
+          const [cosine, sine] = [Math.cos(theta), Math.sin(theta)];
+          for (let c = 0; c < 3; c++) {
+            const target = [cx, cy, cz][c] + radius * (up[c] * cosine + front[c] * sine);
+            x[v * 3 + c] += (target - x[v * 3 + c]) * CUFF_RING_GAIN;
+          }
+        });
+      }
+
+      for (const v of cuff) {
+        const k = v * 3;
+        const t = Math.max(0, Math.min(1, ((x[k] - cap.ax) * abx + (x[k + 1] - cap.ay) * aby + (x[k + 2] - cap.az) * abz) / abLen2));
+        const dx = x[k] - (cap.ax + abx * t);
+        const dy = x[k + 1] - (cap.ay + aby * t);
+        const dz = x[k + 2] - (cap.az + abz * t);
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d <= maxDistance) continue;
+        const pull = (d - maxDistance) / d;
+        x[k] -= dx * pull;
+        x[k + 1] -= dy * pull;
+        x[k + 2] -= dz * pull;
+      }
+    }
+  }
+
+  private cuffRadius(cuff: Uint32Array): number {
+    const cached = this.cuffRadii.get(cuff);
+    if (cached !== undefined) return cached;
+    const members = new Set(cuff);
+    const { i, j, rest } = this.mesh.stretch;
+    let circumference = 0;
+    for (let n = 0; n < rest.length; n++) if (members.has(i[n]) && members.has(j[n])) circumference += rest[n];
+    const radius = circumference / (2 * Math.PI);
+    this.cuffRadii.set(cuff, radius);
+    return radius;
+  }
+
   /** Remove placement strain with zero-compliance iterations, leaving the cloth at rest. */
   settle(iterations: number): void {
     this.interpolateColliders(1);
     for (let it = 0; it < iterations; it++) {
       this.prev.set(this.x);
-      this.solveDistance(this.mesh.stretch, 0);
-      this.solveAttachments(this.params.fixedDt / this.params.substeps);
+      const h = this.params.fixedDt / this.params.substeps;
+      this.solveDistance(this.mesh.stretch, 0, this.params.compressCompliance / (h * h));
+      this.solveAttachments(h);
       this.solveCollisions();
+      this.solveSidePlanes();
+      this.solveCuffs();
     }
     this.prev.set(this.x);
     this.v.fill(0);
@@ -322,7 +444,8 @@ export class ClothSolver {
       const a = i[n] * 3;
       const b = j[n] * 3;
       const len = Math.hypot(x[a] - x[b], x[a + 1] - x[b + 1], x[a + 2] - x[b + 2]);
-      worst = Math.max(worst, Math.abs(len - rest[n]) / rest[n]);
+      // Tensile only: shortened edges are cloth buckling into folds, which is expected.
+      worst = Math.max(worst, (len - rest[n]) / rest[n]);
     }
     return worst;
   }

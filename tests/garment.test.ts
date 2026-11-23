@@ -44,7 +44,11 @@ describe('assembled mesh', () => {
     const pattern = buildTShirtPattern(params);
     const a = assembleGarment(pattern, tShirtPlacement(params), { spacing: 0.03 });
     const b = assembleGarment(pattern, (_, [x, y]) => [x * 3, y * 3, 1], { spacing: 0.03 });
-    expect(Array.from(b.stretch.rest)).toEqual(Array.from(a.stretch.rest));
+    // Constraint order can follow triangle winding, so compare each edge by its vertex pair.
+    const byEdge = (m: typeof a) => new Map(Array.from(m.stretch.rest, (r, n) => [`${m.stretch.i[n]}-${m.stretch.j[n]}`, r]));
+    const [restA, restB] = [byEdge(a), byEdge(b)];
+    expect(restB.size).toBe(restA.size);
+    for (const [edge, r] of restA) expect(restB.get(edge), edge).toBeCloseTo(r, 6);
   });
 
   it.each(sizes)('%s places every sewn edge pair together before relaxation', (size) => {
@@ -79,6 +83,31 @@ describe('assembled mesh', () => {
     const x = mesh.positions;
     const strains = Array.from(rest, (r, n) => Math.abs(Math.hypot(x[i[n] * 3] - x[j[n] * 3], x[i[n] * 3 + 1] - x[j[n] * 3 + 1], x[i[n] * 3 + 2] - x[j[n] * 3 + 2]) - r) / r).sort((p, q) => p - q);
     expect(strains[Math.floor(strains.length * 0.95)]).toBeLessThan(0.08);
+  });
+
+  it.each(sizes)('%s has one consistent outward surface across all seams', (size) => {
+    const params = paramsForSize(size);
+    const mesh = assembleGarment(buildTShirtPattern(params), tShirtPlacement(params), { spacing: 0.03 });
+    const directed = new Set<string>();
+    const t = mesh.triangles;
+    for (let k = 0; k < t.length; k += 3) {
+      for (let n = 0; n < 3; n++) {
+        const id = `${t[k + n]}>${t[k + ((n + 1) % 3)]}`;
+        expect(directed.has(id), `edge ${id} runs the same way in two triangles`).toBe(false);
+        directed.add(id);
+      }
+    }
+    let frontFacing = 0;
+    let frontTotal = 0;
+    const x = mesh.positions;
+    for (let k = 0; k < t.length; k += 3) {
+      const [a, b, c] = [t[k] * 3, t[k + 1] * 3, t[k + 2] * 3];
+      if (Math.abs(x[a]) > 0.1 || x[a + 1] > 0.4 || x[a + 2] < 0.05) continue;
+      frontTotal++;
+      if ((x[b] - x[a]) * (x[c + 1] - x[a + 1]) - (x[b + 1] - x[a + 1]) * (x[c] - x[a]) > 0) frontFacing++;
+    }
+    expect(frontTotal).toBeGreaterThan(0);
+    expect(frontFacing / frontTotal).toBeGreaterThan(0.95);
   });
 
   it('places the neckband as an open ring around the neck', () => {
