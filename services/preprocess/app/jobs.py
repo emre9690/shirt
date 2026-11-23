@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .sewformer_adapter import check_installation, run_inference
 from .store import Store, cache_key
 
 STAGES = ["imported", "images_selected", "pattern_inferred", "mesh_assembled", "asset_validated", "ready"]
@@ -39,8 +40,21 @@ def node_exporter(spec: dict, out_dir: Path) -> None:
         raise RuntimeError(f"Exporter failed: {result.stderr.strip()[-600:]}")
 
 
-def sewformer_step(_spec: dict, _out_dir: Path) -> None:
-    raise Blocked("SewFormer adapter has not produced a verified prediction for this garment.")
+def sewformer_step(spec: dict, out_dir: Path) -> None:
+    """Run the real model and validate it. Never substitutes the template for a failed prediction."""
+    missing = check_installation()
+    if missing:
+        raise Blocked(missing)
+    image = spec.get("onModelPath")
+    if not image or not Path(image).exists():
+        raise Blocked("The selected on-model image is not available.")
+    normalized = run_inference(Path(image), out_dir / "sewformer")
+    if normalized["errors"]:
+        raise RuntimeError("SewFormer prediction rejected: " + "; ".join(normalized["errors"][:6]))
+    raise Blocked(
+        "SewFormer produced a valid T-shirt pattern, but the bridge from its panels to a simulated "
+        "runtime garment is not implemented yet. No garment was created."
+    )
 
 
 class JobRunner:
@@ -67,11 +81,13 @@ class JobRunner:
         article = facts.get("article") or "unknown"
         hashes = [i["sha256"] for i in record.get("images", []) if i["id"] in set(filter(None, selected.values()))]
         garment_id = cache_key(article, facts.get("color") or "", size, method, hashes)
+        on_model = next((i for i in record.get("images", []) if i["id"] == selected.get("onModel")), None)
+        on_model_path = str(self.store.image_path(record["id"], on_model["file"])) if on_model else None
         job = {
             "id": self.store.new_id(), "garmentId": garment_id, "importId": record["id"], "size": size, "method": method,
             "selected": selected, "stage": "imported", "status": "queued", "error": None, "blocked": False,
             "cached": False, "updatedAt": time.time(),
-            "spec": {"size": size, "method": method, "name": facts.get("name") or "T-shirt", "article": article, "source": record.get("url")},
+            "spec": {"size": size, "method": method, "name": facts.get("name") or "T-shirt", "article": article, "source": record.get("url"), "onModelPath": on_model_path},
         }
         _, problems = self.store.verify_garment(garment_id)
         if not problems:
