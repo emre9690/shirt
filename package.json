@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "npm run dev -w apps/web",
     "build": "npm run build -w apps/web",
+    "build:tools": "vite build --config tools/vite.export.config.ts",
+    "assets": "node scripts/fetch-assets.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

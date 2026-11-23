@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { HM_PUBLISHED_SIZES_CM, type ShirtSize } from '@shirt/garment-schema';
 import { GarmentView } from './rendering/garmentView';
-import { prepareTemplateGarment, StageTimer, TryOnSession } from './runtime';
+import { GarmentLibrary } from './GarmentLibrary';
+import { prepareTemplateGarment, StageTimer, TryOnSession, type PreparedGarment } from './runtime';
 import { OneEuroVector } from './tracking/oneEuro';
 import { createPoseTracker, type PoseTracker } from './tracking/pose';
 import {
@@ -42,6 +43,9 @@ export function App() {
   const scaleRef = useRef<number | null>(null);
   const calibrationRef = useRef<number[]>([]);
   const profileRef = useRef<BodyProfile>(DEFAULT_PROFILE);
+  const customRef = useRef<PreparedGarment | null>(null);
+  const [customId, setCustomId] = useState<string | null>(null);
+  const [customLabel, setCustomLabel] = useState('');
 
   const [mode, setModeState] = useState<Mode>('idle');
   const [size, setSize] = useState<ShirtSize>('M');
@@ -81,7 +85,7 @@ export function App() {
   };
 
   const mountGarment = (s: ShirtSize) => {
-    const prepared = prepareTemplateGarment(s);
+    const prepared = customRef.current ?? prepareTemplateGarment(s);
     const view = ensureView();
     view.setGarment(prepared.mesh);
     view.setOptions(optsRef.current);
@@ -226,6 +230,15 @@ export function App() {
     if (sessionRef.current) mountGarment(s);
   };
 
+  const selectGarment = (garment: PreparedGarment | null, id: string | null, label: string) => {
+    customRef.current = garment;
+    setCustomId(id);
+    setCustomLabel(label);
+    if (garment) setSize(garment.size);
+    // Swapping to a cached package only remounts it. Nothing is reconstructed.
+    if (sessionRef.current) mountGarment(garment?.size ?? size);
+  };
+
   const running = mode === 'live' || mode === 'demo' || mode === 'calibrating';
 
   return (
@@ -243,10 +256,10 @@ export function App() {
       <aside className="panel">
         <h1>Live shirt try-on</h1>
         <section className="card">
-          <strong>Regular Fit T-shirt, white</strong>
-          <small>Built-in procedural template. Not a SewFormer reconstruction.</small>
+          <strong>{customLabel || 'Regular Fit T-shirt, white'}</strong>
+          <small>{customId ? 'Prepared package. Size is fixed for this garment.' : 'Built-in procedural template. Not a SewFormer reconstruction.'}</small>
           <label>Size
-            <select value={size} onChange={(e) => changeSize(e.target.value as ShirtSize)}>
+            <select value={size} disabled={customId !== null} onChange={(e) => changeSize(e.target.value as ShirtSize)}>
               {SIZES.map((s) => <option key={s}>{s}</option>)}
             </select>
           </label>
@@ -254,6 +267,7 @@ export function App() {
             <input type="number" min={130} max={220} value={heightCm} disabled={running} onChange={(e) => setHeightCm(Number(e.target.value))} />
           </label>
         </section>
+        <GarmentLibrary size={size} selected={customId} onSelect={selectGarment} />
         <div className="actions">
           <button className="primary" onClick={startCamera}>Start camera</button>
           <button onClick={startDemo}>Synthetic demo</button>
