@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.vite/
+coverage/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.pth
+*.blend1
+.cache/
+services/preprocess/data/
+apps/web/public/mediapipe/
+apps/web/public/models/
