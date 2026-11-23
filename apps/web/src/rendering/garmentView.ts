@@ -167,6 +167,7 @@ export class GarmentView {
     capsules.forEach((c, i) => {
       // Slightly smaller than the collider so cloth resting on it is never clipped.
       this.placeCapsule(this.proxies, i * 3, c, 0.92);
+      for (let part = 0; part < 3; part++) this.proxies[i * 3 + part].visible = c.occludes !== false;
       this.placeCapsule(this.debug, i * 3, c, 1);
     });
     this.debug.forEach((m) => (m.visible = showColliders));

@@ -13,6 +13,8 @@ export interface Capsule {
   sleeveSide?: 1 | -1;
   /** Ignore contacts nearer the capsule start than this fraction (the armhole region). */
   minT?: number;
+  /** False for parts that sit inside the garment and must not cut holes in it when drawn. */
+  occludes?: boolean;
 }
 
 export interface SolverParams {

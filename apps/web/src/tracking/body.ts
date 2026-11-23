@@ -128,10 +128,10 @@ export function bodyCapsules(p: BodyPose, profile: BodyProfile): Capsule[] {
   return [
     capsule(toWorld(f, r.torsoOffset, topY, 0), toWorld(f, r.torsoOffset, bottomY, 0), r.torso),
     capsule(toWorld(f, -r.torsoOffset, topY, 0), toWorld(f, -r.torsoOffset, bottomY, 0), r.torso),
-    capsule(ls, rs, r.upperArm * 1.1),
-    arm(ls, p.le, r.upperArm, 1, 0.25),
+    { ...capsule(ls, rs, r.upperArm * 1.1), occludes: false },
+    { ...arm(ls, p.le, r.upperArm, 1, 0.25), occludes: false },
     arm(p.le, p.lw, r.foreArm, 1),
-    arm(rs, p.re, r.upperArm, -1, 0.25),
+    { ...arm(rs, p.re, r.upperArm, -1, 0.25), occludes: false },
     arm(p.re, p.rw, r.foreArm, -1),
   ];
 }
