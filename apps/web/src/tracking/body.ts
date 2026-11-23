@@ -108,6 +108,16 @@ export function bodyRadii(pose: BodyPose, profile: BodyProfile): BodyRadii {
   return { torso, torsoOffset, upperArm: 0.048 * scale, foreArm: 0.038 * scale };
 }
 
+/**
+ * Depth-only neck, never a collider. It hides the inside back of the shirt so the wearer's
+ * real neck shows through the collar opening.
+ */
+export function neckOccluder(p: BodyPose, profile: BodyProfile): Capsule {
+  const f = bodyFrame(p);
+  const scale = profile.heightM / 1.75;
+  return capsule(toWorld(f, 0, -0.02 * scale, -0.012 * scale), toWorld(f, 0, 0.17 * scale, -0.005 * scale), 0.066 * scale);
+}
+
 const SHOULDER_BAR_RATIO = 0.6;
 
 /** Height of the shoulder seam above the shoulder joint centre. */
@@ -229,7 +239,7 @@ export function armholeBlend(mesh: GarmentMesh, radius = 0.07): ArmholeBlend {
 }
 
 /** Sparse, compliant collar support. Everything below the neckband hangs freely. */
-export function collarAttachments(rest: Float32Array, neck: Uint32Array, garment: TShirtParams, p: BodyPose, lift = 0.07, compliance = 2e-2): Attachment[] {
+export function collarAttachments(rest: Float32Array, neck: Uint32Array, garment: TShirtParams, p: BodyPose, lift = 0.07, compliance = 2e-4): Attachment[] {
   const f = bodyFrame(p);
   const shoulderY = garment.bodyLength - garment.shoulderDrop - lift;
   return Array.from(neck, (index) => {

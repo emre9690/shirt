@@ -5,6 +5,9 @@ import type { ImageFit } from '../tracking/body';
 
 /** Drawn thickness, including the folded hem look. Slightly above real jersey so edges read on camera. */
 const FABRIC_HALF_THICKNESS_M = 0.0018;
+const INNER_SHADE = 0.55;
+const BACK_PANEL = 1;
+const NECKBAND_PANEL = 4;
 
 export interface ViewOptions {
   wireframe: boolean;
@@ -41,16 +44,17 @@ export class GarmentView {
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.setPixelRatio(1);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.material = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, metalness: 0, side: THREE.FrontSide, transparent: true });
+    this.material = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, metalness: 0, side: THREE.FrontSide, transparent: true, vertexColors: true });
     this.mesh = new THREE.Mesh(this.geometry, this.material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 2;
     this.root.add(this.mesh);
     this.root.matrixAutoUpdate = false;
     this.scene.add(this.root);
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xc9c6c0, 2.5));
-    const key = new THREE.DirectionalLight(0xffffff, 0.9);
-    key.position.set(0.3, 0.8, 1);
+    // Less flat fill and a raking key light, so folds show on white fabric instead of clipping.
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xbdb9b2, 2.35));
+    const key = new THREE.DirectionalLight(0xffffff, 1.0);
+    key.position.set(-0.55, 0.75, 0.7);
     this.scene.add(key);
     this.camera.position.z = 3000;
   }
@@ -126,6 +130,14 @@ export class GarmentView {
     this.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(total * 3), 3).setUsage(THREE.DynamicDrawUsage));
     this.geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(total * 3), 3).setUsage(THREE.DynamicDrawUsage));
     this.geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    // Through the collar you see the shadowed inside of the back and neckband. Other inner
+    // faces only show where cloth folds over, and those should not read as dark holes.
+    const color = new Float32Array(total * 3).fill(1);
+    for (let r = 0; r < count; r++) {
+      if (mesh.renderPanel[r] !== BACK_PANEL && mesh.renderPanel[r] !== NECKBAND_PANEL) continue;
+      color.fill(INNER_SHADE, (r + count) * 3, (r + count + 1) * 3);
+    }
+    this.geometry.setAttribute('color', new THREE.BufferAttribute(color, 3));
     this.geometry.setIndex(new THREE.BufferAttribute(index, 1));
     this.mesh.geometry = this.geometry;
   }

@@ -1,6 +1,6 @@
 import type { PreparedGarment } from '../runtime';
 import { TryOnSession } from '../runtime';
-import { bodyCapsules, type BodyPose, type BodyProfile } from '../tracking/body';
+import { bodyCapsules, neckOccluder, type BodyPose, type BodyProfile } from '../tracking/body';
 import type { Capsule } from './xpbd';
 import type { WorkerRequest, WorkerResult } from './worker';
 
@@ -57,7 +57,8 @@ export class PhysicsClient {
 
   updatePose(pose: BodyPose): void {
     this.pose = pose;
-    this.capsules = bodyCapsules(pose, this.profile);
+    // Used for drawing only. The solver builds its own colliders, which exclude the neck.
+    this.capsules = [...bodyCapsules(pose, this.profile), neckOccluder(pose, this.profile)];
   }
 
   markTrackingLost(): void {

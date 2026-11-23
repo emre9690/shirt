@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -12,6 +13,8 @@ PIPELINE_VERSION = "1"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 IMAGE_SIGNATURES = {b"\xff\xd8\xff": ".jpg", b"\x89PNG\r\n\x1a\n": ".png"}
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
+FILE_RETRIES = 40
+FILE_RETRY_SECONDS = 0.025
 
 
 def image_extension(data: bytes) -> str | None:
@@ -49,7 +52,27 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         temp.write_text(json.dumps(value, indent=2), encoding="utf-8")
-        os.replace(temp, path)
+        # On Windows, replacing a file fails while another thread has it open for reading.
+        for attempt in range(FILE_RETRIES):
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError:
+                if attempt == FILE_RETRIES - 1:
+                    temp.unlink(missing_ok=True)
+                    raise
+                time.sleep(FILE_RETRY_SECONDS)
+
+    @staticmethod
+    def read_json(path: Path) -> dict:
+        for attempt in range(FILE_RETRIES):
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except PermissionError:
+                if attempt == FILE_RETRIES - 1:
+                    raise
+                time.sleep(FILE_RETRY_SECONDS)
+        raise RuntimeError("unreachable")
 
     def new_id(self) -> str:
         return uuid.uuid4().hex
@@ -61,7 +84,7 @@ class Store:
         path = self._path("imports", import_id) / "import.json"
         if not path.exists():
             raise KeyError(import_id)
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.read_json(path)
 
     def add_image(self, import_id: str, data: bytes) -> dict:
         extension = image_extension(data)
@@ -88,7 +111,7 @@ class Store:
         path = self._path("jobs", job_id).with_suffix(".json")
         if not path.exists():
             raise KeyError(job_id)
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.read_json(path)
 
     def garment_dir(self, garment_id: str) -> Path:
         return self._path("garments", garment_id)
